@@ -1,6 +1,8 @@
 //! POC: sticky-note windows whose titlebar is the same color as the body.
 mod herdr;
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::Path;
 use std::ptr::NonNull;
 use std::rc::Rc;
@@ -24,7 +26,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{
     NSAttributedString, NSDictionary, NSNotification, NSNotificationCenter, NSNotificationName,
-    NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSUserDefaults,
+    NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSTimer, NSUserDefaults,
 };
 use rusqlite::{Connection, OptionalExtension};
 
@@ -53,10 +55,17 @@ fn main() {
     std::fs::create_dir_all(&dir).expect("can't create the app data dir");
     let db = Rc::new(open_db(&dir.join("notes.sqlite")));
 
-    let notes = (0..COLORS.len()).map(|i| note(mtm, i, &db)).collect();
+    let (notes, ticks): (Vec<_>, Vec<_>) = (0..COLORS.len()).map(|i| note(mtm, i, &db)).unzip();
     // NSApp holds its delegate weakly; this binding keeps it (and the notes) alive until exit.
     let delegate = Delegate::new(mtm, notes);
     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+
+    // Every 10s, each note looks at its workspace's screens for changes, and updates its age.
+    let tick = move || ticks.iter().for_each(|tick| tick());
+    tick();
+    let tick = RcBlock::new(move |_: NonNull<NSTimer>| tick());
+    // SAFETY: needn't be Send, as a timer scheduled here fires on this (main) thread's run loop.
+    unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(10.0, true, &tick) };
 
     // `activate()` is cooperative since macOS 14 and doesn't bring a shell-launched,
     // unbundled binary to the front; the deprecated call still does.
@@ -65,7 +74,12 @@ fn main() {
     app.run();
 }
 
-fn note(mtm: MainThreadMarker, i: usize, db: &Rc<Connection>) -> Retained<NSWindow> {
+/// Returns the note, and what updates its age.
+fn note(
+    mtm: MainThreadMarker,
+    i: usize,
+    db: &Rc<Connection>,
+) -> (Retained<NSWindow>, Rc<dyn Fn()>) {
     let (r, g, b) = COLORS[i];
     let color = NSColor::colorWithSRGBRed_green_blue_alpha(r, g, b, 1.0);
     let origin = NSPoint::new(100.0 + i as f64 * (SIZE + 30.0), 400.0);
@@ -212,6 +226,36 @@ fn note(mtm: MainThreadMarker, i: usize, db: &Rc<Connection>) -> Retained<NSWind
     picker.setHidden(true);
     body.addSubview(&picker);
 
+    // Top right, 8px in like the text: how long ago anything changed on the workspace's screens
+    // (see `ago`), blank if never seen. In the workspace's bold gray, a little bigger.
+    let age = NSTextField::labelWithString(&NSString::new(), mtm);
+    age.setFont(Some(&NSFont::boldSystemFontOfSize(15.0)));
+    age.setTextColor(Some(&NSColor::tertiaryLabelColor()));
+    age.setAlignment(NSTextAlignment::Right);
+    let h = age.intrinsicContentSize().height;
+    age.setFrame(NSRect::new(
+        NSPoint::new(half, SIZE - 8.0 - h),
+        NSSize::new(half - 8.0, h),
+    ));
+    // Like the text, it stays at the top when the titlebar takes its share of the height.
+    age.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinYMargin);
+    body.addSubview(&age);
+    // What its panes showed at the last look, by pane id.
+    let (db2, label, screens) = (
+        Rc::clone(db),
+        workspace.clone(),
+        RefCell::new(HashMap::new()),
+    );
+    let tick: Rc<dyn Fn()> = Rc::new(move || {
+        let name = label.stringValue().to_string();
+        // Unreachable (not running?), the age just goes on counting.
+        if herdr::changed(&herdr::socket(), &name, &mut screens.borrow_mut()).unwrap_or(false) {
+            set_worked(&db2, &name);
+        }
+        let secs = worked_ago(&db2, &name);
+        age.setStringValue(&NSString::from_str(&secs.map(ago).unwrap_or_default()));
+    });
+
     let (label, combo, win) = (workspace.clone(), picker.clone(), window.clone());
     observe(&NSString::from_str(DOUBLE_CLICK), &workspace, move || {
         combo.removeAllItems();
@@ -234,12 +278,13 @@ fn note(mtm: MainThreadMarker, i: usize, db: &Rc<Connection>) -> Retained<NSWind
         win.makeFirstResponder(Some(&combo));
     });
     // Done (Return, or a click elsewhere): back to the label, and on to the note's text.
-    let (db2, label, combo, win, text2) = (
+    let (db2, label, combo, win, text2, tick2) = (
         Rc::clone(db),
         workspace.clone(),
         picker.clone(),
         window.clone(),
         text.clone(),
+        Rc::clone(&tick),
     );
     observe(
         unsafe { NSControlTextDidEndEditingNotification },
@@ -251,6 +296,7 @@ fn note(mtm: MainThreadMarker, i: usize, db: &Rc<Connection>) -> Retained<NSWind
                 let s = if s == NO_WORKSPACE { "" } else { s.as_str() };
                 label.setStringValue(&NSString::from_str(s));
                 save(&db2, "workspaces", i, s);
+                tick2();
             }
             combo.setHidden(true);
             label.setHidden(false);
@@ -277,7 +323,17 @@ fn note(mtm: MainThreadMarker, i: usize, db: &Rc<Connection>) -> Retained<NSWind
     );
 
     window.makeKeyAndOrderFront(None);
-    window
+    (window, tick)
+}
+
+/// `secs` ago, cut down to its biggest unit, to read at a glance: "now", "10m", "2h" or "3d".
+fn ago(secs: i64) -> String {
+    match secs {
+        ..60 => "now".to_owned(),
+        60..3600 => format!("{}m", secs / 60),
+        3600..86400 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86400),
+    }
 }
 
 /// Posted by a [`Label`] when double-clicked.
@@ -323,13 +379,14 @@ fn observe(name: &NSNotificationName, object: &AnyObject, f: impl Fn() + 'static
 
 /// One row per note in each table, keyed by the note index (like the `note{i}` frame autosave
 /// names). Titles and workspaces got their own tables, not columns, so notes dbs from before need
-/// no migration.
+/// no migration. Except `worked`: one row per herdr workspace (by name) a note has seen in use.
 fn open_db(path: &Path) -> Connection {
     let db = Connection::open(path).expect("can't open the notes db");
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, text TEXT NOT NULL);
          CREATE TABLE IF NOT EXISTS titles (id INTEGER PRIMARY KEY, text TEXT NOT NULL);
-         CREATE TABLE IF NOT EXISTS workspaces (id INTEGER PRIMARY KEY, text TEXT NOT NULL);",
+         CREATE TABLE IF NOT EXISTS workspaces (id INTEGER PRIMARY KEY, text TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS worked (name TEXT PRIMARY KEY, at INTEGER NOT NULL);",
     )
     .expect("can't create the notes tables");
     db
@@ -350,6 +407,22 @@ fn save(db: &Connection, table: &'static str, id: usize, text: &str) {
     if let Err(e) = db.execute(&sql, (id as i64, text)) {
         eprintln!("can't save note{id} ({table}): {e}");
     }
+}
+
+/// Writes down that the workspace named `name` is in use, or just was.
+fn set_worked(db: &Connection, name: &str) {
+    // Log, don't panic: this runs inside an AppKit callback, and the next poll retries.
+    let sql = "INSERT OR REPLACE INTO worked (name, at) VALUES (?1, unixepoch())";
+    if let Err(e) = db.execute(sql, [name]) {
+        eprintln!("can't save when {name} worked: {e}");
+    }
+}
+
+/// How many seconds ago the workspace named `name` was last seen in use.
+fn worked_ago(db: &Connection, name: &str) -> Option<i64> {
+    // Errors leave the age blank too: it's only for show, and the next poll retries.
+    let sql = "SELECT unixepoch() - at FROM worked WHERE name = ?1";
+    db.query_row(sql, [name], |row| row.get(0)).ok()
 }
 
 /// Without a menu bar there's no Cmd+Q and no copy/paste in the text views.
@@ -463,4 +536,16 @@ fn notes_round_trip() {
     assert_eq!(load(&db, "titles", 0).as_deref(), Some("title"));
     assert_eq!(load(&db, "titles", 1), None);
     assert_eq!(load(&db, "workspaces", 1).as_deref(), Some("focus"));
+    assert_eq!(worked_ago(&db, "focus"), None);
+    set_worked(&db, "focus");
+    assert!(worked_ago(&db, "focus").is_some_and(|secs| (0..=1).contains(&secs)));
+}
+
+#[test]
+fn ages_read_at_a_glance() {
+    let ages = [-5, 0, 59, 60, 3599, 3600, 86399, 86400, 30 * 86400].map(ago);
+    assert_eq!(
+        ages,
+        ["now", "now", "now", "1m", "59m", "1h", "23h", "1d", "30d"]
+    );
 }

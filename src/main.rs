@@ -5,14 +5,19 @@ use std::rc::Rc;
 
 use block2::RcBlock;
 use objc2::rc::Retained;
-use objc2::runtime::Sel;
-use objc2::{MainThreadMarker, MainThreadOnly, sel};
+use objc2::runtime::{AnyObject, ProtocolObject, Sel};
+use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSAppearance, NSAppearanceNameAqua, NSApplication, NSApplicationActivationPolicy,
-    NSAutoresizingMaskOptions, NSColor, NSMenu, NSMenuItem, NSTextDidChangeNotification,
-    NSTextView, NSView, NSViewController, NSWindow, NSWindowTitleVisibility,
+    NSApplicationDelegate, NSAutoresizingMaskOptions, NSColor, NSControlStateValueOff,
+    NSControlStateValueOn, NSFloatingWindowLevel, NSMenu, NSMenuItem, NSMenuItemValidation,
+    NSNormalWindowLevel, NSTextDidChangeNotification, NSTextView, NSView, NSViewController,
+    NSWindow, NSWindowTitleVisibility,
 };
-use objc2_foundation::{NSNotification, NSNotificationCenter, NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{
+    NSNotification, NSNotificationCenter, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
+    NSString, NSUserDefaults,
+};
 use rusqlite::{Connection, OptionalExtension};
 
 const SIZE: f64 = 220.0;
@@ -22,6 +27,8 @@ const COLORS: [(f64, f64, f64); 4] = [
     (0.70, 0.88, 1.00), // blue
     (0.78, 0.95, 0.66), // green
 ];
+/// User defaults key behind Window > Keep All Windows on Top.
+const KEEP_ON_TOP: &str = "KeepOnTop";
 
 fn main() {
     let mtm = MainThreadMarker::new().expect("must run on the main thread");
@@ -38,7 +45,10 @@ fn main() {
     std::fs::create_dir_all(&dir).expect("can't create the app data dir");
     let db = Rc::new(open_db(&dir.join("notes.sqlite")));
 
-    let _notes: Vec<_> = (0..COLORS.len()).map(|i| note(mtm, i, &db)).collect();
+    let notes = (0..COLORS.len()).map(|i| note(mtm, i, &db)).collect();
+    // NSApp holds its delegate weakly; this binding keeps it (and the notes) alive until exit.
+    let delegate = Delegate::new(mtm, notes);
+    app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
 
     // `activate()` is cooperative since macOS 14 and doesn't bring a shell-launched,
     // unbundled binary to the front; the deprecated call still does.
@@ -162,6 +172,11 @@ fn main_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
             ("Select All", sel!(selectAll:), "a"),
         ],
     ));
+    bar.addItem(&submenu(
+        mtm,
+        "Window",
+        &[("Keep All Windows on Top", sel!(toggleKeepOnTop:), "")],
+    ));
     bar
 }
 
@@ -173,12 +188,71 @@ fn submenu(
     let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str(title));
     for &(title, action, key) in items {
         let (title, key) = (NSString::from_str(title), NSString::from_str(key));
-        // nil target: the action goes up the responder chain (text view, then NSApp).
+        // nil target: the action goes up the responder chain (text view, NSApp, then its delegate).
         unsafe { menu.addItemWithTitle_action_keyEquivalent(&title, Some(action), &key) };
     }
     let top = NSMenuItem::new(mtm);
     top.setSubmenu(Some(&menu));
     top
+}
+
+define_class!(
+    // SAFETY: NSObject has no subclassing requirements, and Delegate doesn't implement Drop.
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = Vec<Retained<NSWindow>>]
+    struct Delegate;
+
+    unsafe impl NSObjectProtocol for Delegate {}
+    unsafe impl NSApplicationDelegate for Delegate {}
+
+    unsafe impl NSMenuItemValidation for Delegate {
+        // Keep All Windows on Top is the only item whose action reaches us: checkmark it when on.
+        #[unsafe(method(validateMenuItem:))]
+        fn validate_menu_item(&self, item: &NSMenuItem) -> bool {
+            item.setState(if keep_on_top() {
+                NSControlStateValueOn
+            } else {
+                NSControlStateValueOff
+            });
+            true
+        }
+    }
+
+    impl Delegate {
+        #[unsafe(method(toggleKeepOnTop:))]
+        fn toggle_keep_on_top(&self, _sender: Option<&AnyObject>) {
+            NSUserDefaults::standardUserDefaults()
+                .setBool_forKey(!keep_on_top(), &NSString::from_str(KEEP_ON_TOP));
+            self.float();
+        }
+    }
+);
+
+impl Delegate {
+    fn new(mtm: MainThreadMarker, notes: Vec<Retained<NSWindow>>) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(notes);
+        let this: Retained<Self> = unsafe { msg_send![super(this), init] };
+        this.float();
+        this
+    }
+
+    /// Floating windows stay above other apps' windows, even when we're in the background.
+    fn float(&self) {
+        let level = if keep_on_top() {
+            NSFloatingWindowLevel
+        } else {
+            NSNormalWindowLevel
+        };
+        for note in self.ivars() {
+            note.setLevel(level);
+        }
+    }
+}
+
+/// Saved in the user defaults next to the note frames (`defaults read focus`), so it survives relaunches.
+fn keep_on_top() -> bool {
+    NSUserDefaults::standardUserDefaults().boolForKey(&NSString::from_str(KEEP_ON_TOP))
 }
 
 #[test]

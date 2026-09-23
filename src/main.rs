@@ -57,6 +57,9 @@ fn note(mtm: MainThreadMarker, i: usize) -> Retained<NSWindow> {
     window.setTitleVisibility(NSWindowTitleVisibility::Hidden); // defaults to "Untitled"
     window.setBackgroundColor(Some(&color));
     window.setFrame_display(NSRect::new(origin, NSSize::new(SIZE, SIZE)), false);
+    // After setFrame, not before: restores the frame saved in the user defaults
+    // (`defaults read focus`) and re-saves it on every move/resize.
+    window.setFrameAutosaveName(&NSString::from_str(&format!("note{i}")));
     window.makeKeyAndOrderFront(None);
     window
 }

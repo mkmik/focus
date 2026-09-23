@@ -12,7 +12,7 @@ use objc2_app_kit::{
     NSApplicationDelegate, NSAutoresizingMaskOptions, NSColor, NSControlStateValueOff,
     NSControlStateValueOn, NSFloatingWindowLevel, NSMenu, NSMenuItem, NSMenuItemValidation,
     NSNormalWindowLevel, NSTextDidChangeNotification, NSTextView, NSView, NSViewController,
-    NSWindow, NSWindowTitleVisibility,
+    NSWindow, NSWindowStyleMask, NSWindowTitleVisibility,
 };
 use objc2_foundation::{
     NSNotification, NSNotificationCenter, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
@@ -117,14 +117,16 @@ fn note(mtm: MainThreadMarker, i: usize, db: &Rc<Connection>) -> Retained<NSWind
 
     // Titled, closable, miniaturizable, resizable; not released on close (the Retained owns it).
     let window = NSWindow::windowWithContentViewController(&vc);
+    // Close button only: minimize and zoom gray out, and the edges don't resize.
+    window.setStyleMask(NSWindowStyleMask::Titled | NSWindowStyleMask::Closable);
     // The trick: a transparent titlebar draws nothing, so the window's background
     // color shows through it and titlebar + body become one uniform color.
     window.setTitlebarAppearsTransparent(true);
     window.setTitleVisibility(NSWindowTitleVisibility::Hidden); // defaults to "Untitled"
     window.setBackgroundColor(Some(&color));
     window.setFrame_display(NSRect::new(origin, NSSize::new(SIZE, SIZE)), false);
-    // After setFrame, not before: restores the frame saved in the user defaults
-    // (`defaults read focus`) and re-saves it on every move/resize.
+    // After setFrame, not before: restores the position saved in the user defaults
+    // (`defaults read focus`) and re-saves it on every move. Being non-resizable, it keeps SIZE.
     window.setFrameAutosaveName(&NSString::from_str(&format!("note{i}")));
     window.makeKeyAndOrderFront(None);
     window

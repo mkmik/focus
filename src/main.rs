@@ -3,8 +3,9 @@ use objc2::rc::Retained;
 use objc2::runtime::Sel;
 use objc2::{MainThreadMarker, MainThreadOnly, sel};
 use objc2_app_kit::{
-    NSAppearance, NSAppearanceNameAqua, NSApplication, NSApplicationActivationPolicy, NSColor,
-    NSMenu, NSMenuItem, NSTextView, NSViewController, NSWindow, NSWindowTitleVisibility,
+    NSAppearance, NSAppearanceNameAqua, NSApplication, NSApplicationActivationPolicy,
+    NSAutoresizingMaskOptions, NSColor, NSMenu, NSMenuItem, NSTextView, NSView, NSViewController,
+    NSWindow, NSWindowTitleVisibility,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
@@ -46,8 +47,32 @@ fn note(mtm: MainThreadMarker, i: usize) -> Retained<NSWindow> {
         .downcast::<NSTextView>()
         .unwrap();
     text.setDrawsBackground(false);
+    // 8px padding on every side; the inset alone would stack on the default 5px line padding.
+    text.setTextContainerInset(NSSize::new(8.0, 8.0));
+    unsafe { text.textContainer() }
+        .unwrap()
+        .setLineFragmentPadding(0.0);
+
+    // Only the top-left quarter of the note is text (non-flipped: y grows upwards).
+    // Size and right/bottom margins are all flexible, so resizes split evenly and keep it a quarter.
+    let half = SIZE / 2.0;
+    let body = NSView::initWithFrame(
+        NSView::alloc(mtm),
+        NSRect::new(NSPoint::ZERO, NSSize::new(SIZE, SIZE)),
+    );
+    scroll.setFrame(NSRect::new(
+        NSPoint::new(0.0, half),
+        NSSize::new(half, half),
+    ));
+    scroll.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewWidthSizable
+            | NSAutoresizingMaskOptions::ViewMaxXMargin
+            | NSAutoresizingMaskOptions::ViewHeightSizable
+            | NSAutoresizingMaskOptions::ViewMinYMargin,
+    );
+    body.addSubview(&scroll);
     let vc = NSViewController::new(mtm);
-    vc.setView(&scroll);
+    vc.setView(&body);
 
     // Titled, closable, miniaturizable, resizable; not released on close (the Retained owns it).
     let window = NSWindow::windowWithContentViewController(&vc);

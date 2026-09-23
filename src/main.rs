@@ -6,17 +6,21 @@ use std::rc::Rc;
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
-use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
+use objc2::{
+    ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel,
+};
 use objc2_app_kit::{
     NSAppearance, NSAppearanceNameAqua, NSApplication, NSApplicationActivationPolicy,
-    NSApplicationDelegate, NSAutoresizingMaskOptions, NSColor, NSControlStateValueOff,
-    NSControlStateValueOn, NSFloatingWindowLevel, NSMenu, NSMenuItem, NSMenuItemValidation,
-    NSNormalWindowLevel, NSTextDidChangeNotification, NSTextView, NSView, NSViewController,
-    NSWindow, NSWindowStyleMask, NSWindowTitleVisibility,
+    NSApplicationDelegate, NSAutoresizingMaskOptions, NSColor, NSControl, NSControlStateValueOff,
+    NSControlStateValueOn, NSControlTextDidChangeNotification,
+    NSControlTextDidEndEditingNotification, NSEvent, NSFloatingWindowLevel, NSFont,
+    NSLineBreakMode, NSMenu, NSMenuItem, NSMenuItemValidation, NSNormalWindowLevel, NSResponder,
+    NSTextDidChangeNotification, NSTextField, NSTextView, NSView, NSViewController, NSWindow,
+    NSWindowButton, NSWindowStyleMask, NSWindowTitleVisibility,
 };
 use objc2_foundation::{
-    NSNotification, NSNotificationCenter, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
-    NSString, NSUserDefaults,
+    NSNotification, NSNotificationCenter, NSNotificationName, NSObject, NSObjectProtocol, NSPoint,
+    NSRect, NSSize, NSString, NSUserDefaults,
 };
 use rusqlite::{Connection, OptionalExtension};
 
@@ -76,23 +80,15 @@ fn note(mtm: MainThreadMarker, i: usize, db: &Rc<Connection>) -> Retained<NSWind
         .unwrap()
         .setLineFragmentPadding(0.0);
 
-    if let Some(saved) = load(db, i) {
+    if let Some(saved) = load(db, "notes", i) {
         text.setString(&NSString::from_str(&saved));
     }
     // Save on every edit (typing, paste, cut), so quitting via Ctrl+C or a crash loses nothing.
     // `setString` doesn't post this notification, so loading above doesn't re-save.
-    let (db, view) = (Rc::clone(db), text.clone());
-    let on_change =
-        RcBlock::new(move |_: NonNull<NSNotification>| save(&db, i, &view.string().to_string()));
-    // No queue: the block runs synchronously on the posting (main) thread, so it needn't be Send.
-    unsafe {
-        NSNotificationCenter::defaultCenter().addObserverForName_object_queue_usingBlock(
-            Some(NSTextDidChangeNotification),
-            Some(&text),
-            None,
-            &on_change,
-        )
-    };
+    let (db2, view) = (Rc::clone(db), text.clone());
+    observe(unsafe { NSTextDidChangeNotification }, &text, move || {
+        save(&db2, "notes", i, &view.string().to_string())
+    });
 
     // Only the top-left quarter of the note is text (non-flipped: y grows upwards).
     // Size and right/bottom margins are all flexible, so resizes split evenly and keep it a quarter.
@@ -122,41 +118,114 @@ fn note(mtm: MainThreadMarker, i: usize, db: &Rc<Connection>) -> Retained<NSWind
     // The trick: a transparent titlebar draws nothing, so the window's background
     // color shows through it and titlebar + body become one uniform color.
     window.setTitlebarAppearsTransparent(true);
-    window.setTitleVisibility(NSWindowTitleVisibility::Hidden); // defaults to "Untitled"
+    window.setTitleVisibility(NSWindowTitleVisibility::Hidden); // we draw an editable one below
     window.setBackgroundColor(Some(&color));
     window.setFrame_display(NSRect::new(origin, NSSize::new(SIZE, SIZE)), false);
     // After setFrame, not before: restores the position saved in the user defaults
     // (`defaults read focus`) and re-saves it on every move. Being non-resizable, it keeps SIZE.
     window.setFrameAutosaveName(&NSString::from_str(&format!("note{i}")));
+
+    // The title: a label pixel-identical to AppKit's own title once that's too long to center
+    // (titlebar font, from 6pt past the traffic lights to 6pt before the edge, 1pt above them).
+    let saved = NSString::from_str(&load(db, "titles", i).unwrap_or_default());
+    let title: Retained<Title> = unsafe { msg_send![Title::class(), labelWithString: &*saved] };
+    title.setFont(Some(&NSFont::titleBarFontOfSize(0.0)));
+    title.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+    let zoom = window
+        .standardWindowButton(NSWindowButton::ZoomButton)
+        .unwrap();
+    let (x, y) = (zoom.frame().max().x + 6.0, zoom.frame().min().y + 1.0);
+    let size = NSSize::new(SIZE - x - 6.0, zoom.frame().size.height);
+    title.setFrame(NSRect::new(NSPoint::new(x, y), size));
+    unsafe { zoom.superview() }.unwrap().addSubview(&title);
+    // The real title stays hidden, but VoiceOver and the Dock's window list still read it.
+    window.setTitle(&saved);
+    let (db2, field, win) = (Rc::clone(db), title.clone(), window.clone());
+    observe(
+        unsafe { NSControlTextDidChangeNotification },
+        &title,
+        move || {
+            let s = field.stringValue();
+            win.setTitle(&s);
+            save(&db2, "titles", i, &s.to_string());
+        },
+    );
+    // Done (Return, or a click in the note): back to a label, and on to the note's text.
+    let (field, win) = (title.clone(), window.clone());
+    observe(
+        unsafe { NSControlTextDidEndEditingNotification },
+        &title,
+        move || {
+            field.setEditable(false);
+            win.makeFirstResponder(Some(&text));
+        },
+    );
+
     window.makeKeyAndOrderFront(None);
     window
 }
 
-/// One row per note, keyed by the note index (like the `note{i}` frame autosave names).
+define_class!(
+    // SAFETY: NSTextField has no subclassing requirements, and Title doesn't implement Drop.
+    #[unsafe(super(NSTextField, NSControl, NSView, NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    struct Title;
+
+    impl Title {
+        // A double-click edits it, all selected, like renaming in Finder. Other clicks get the
+        // label default, and a label counts as titlebar: dragging it moves the window.
+        #[unsafe(method(mouseDown:))]
+        fn mouse_down(&self, event: &NSEvent) {
+            if event.clickCount() == 2 {
+                self.setEditable(true);
+                self.window().unwrap().makeFirstResponder(Some(self));
+            } else {
+                unsafe { msg_send![super(self), mouseDown: event] }
+            }
+        }
+    }
+);
+
+/// Runs `f` on every `name` notification `object` posts. No queue: it runs synchronously on the
+/// posting (main) thread, so it needn't be Send.
+fn observe(name: &NSNotificationName, object: &AnyObject, f: impl Fn() + 'static) {
+    let block = RcBlock::new(move |_: NonNull<NSNotification>| f());
+    unsafe {
+        NSNotificationCenter::defaultCenter().addObserverForName_object_queue_usingBlock(
+            Some(name),
+            Some(object),
+            None,
+            &block,
+        )
+    };
+}
+
+/// One row per note in each table, keyed by the note index (like the `note{i}` frame autosave
+/// names). Titles got their own table, not a column, so notes dbs from before need no migration.
 fn open_db(path: &Path) -> Connection {
     let db = Connection::open(path).expect("can't open the notes db");
-    db.execute(
-        "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, text TEXT NOT NULL)",
-        (),
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, text TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS titles (id INTEGER PRIMARY KEY, text TEXT NOT NULL);",
     )
-    .expect("can't create the notes table");
+    .expect("can't create the notes tables");
     db
 }
 
-fn load(db: &Connection, id: usize) -> Option<String> {
+/// `table` goes into the SQL as is, hence 'static: "notes" or "titles".
+fn load(db: &Connection, table: &'static str, id: usize) -> Option<String> {
     // Fatal: starting blank would overwrite the saved note on the first keystroke.
-    db.query_row("SELECT text FROM notes WHERE id = ?1", [id as i64], |row| {
-        row.get(0)
-    })
-    .optional()
-    .expect("can't read the notes db")
+    let sql = format!("SELECT text FROM {table} WHERE id = ?1");
+    db.query_row(&sql, [id as i64], |row| row.get(0))
+        .optional()
+        .expect("can't read the notes db")
 }
 
-fn save(db: &Connection, id: usize, text: &str) {
+fn save(db: &Connection, table: &'static str, id: usize, text: &str) {
     // Log, don't panic: this runs inside an AppKit callback, and the next edit retries.
-    let sql = "INSERT OR REPLACE INTO notes (id, text) VALUES (?1, ?2)";
-    if let Err(e) = db.execute(sql, (id as i64, text)) {
-        eprintln!("can't save note{id}: {e}");
+    let sql = format!("INSERT OR REPLACE INTO {table} (id, text) VALUES (?1, ?2)");
+    if let Err(e) = db.execute(&sql, (id as i64, text)) {
+        eprintln!("can't save note{id} ({table}): {e}");
     }
 }
 
@@ -260,10 +329,13 @@ fn keep_on_top() -> bool {
 #[test]
 fn notes_round_trip() {
     let db = open_db(Path::new(":memory:"));
-    assert_eq!(load(&db, 0), None);
-    save(&db, 0, "first");
-    save(&db, 0, "second");
-    save(&db, 1, "");
-    assert_eq!(load(&db, 0).as_deref(), Some("second"));
-    assert_eq!(load(&db, 1).as_deref(), Some(""));
+    assert_eq!(load(&db, "notes", 0), None);
+    save(&db, "notes", 0, "first");
+    save(&db, "notes", 0, "second");
+    save(&db, "notes", 1, "");
+    save(&db, "titles", 0, "title");
+    assert_eq!(load(&db, "notes", 0).as_deref(), Some("second"));
+    assert_eq!(load(&db, "notes", 1).as_deref(), Some(""));
+    assert_eq!(load(&db, "titles", 0).as_deref(), Some("title"));
+    assert_eq!(load(&db, "titles", 1), None);
 }

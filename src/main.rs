@@ -1,13 +1,19 @@
 //! POC: sticky-note windows whose titlebar is the same color as the body.
+use std::path::Path;
+use std::ptr::NonNull;
+use std::rc::Rc;
+
+use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::Sel;
 use objc2::{MainThreadMarker, MainThreadOnly, sel};
 use objc2_app_kit::{
     NSAppearance, NSAppearanceNameAqua, NSApplication, NSApplicationActivationPolicy,
-    NSAutoresizingMaskOptions, NSColor, NSMenu, NSMenuItem, NSTextView, NSView, NSViewController,
-    NSWindow, NSWindowTitleVisibility,
+    NSAutoresizingMaskOptions, NSColor, NSMenu, NSMenuItem, NSTextDidChangeNotification,
+    NSTextView, NSView, NSViewController, NSWindow, NSWindowTitleVisibility,
 };
-use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{NSNotification, NSNotificationCenter, NSPoint, NSRect, NSSize, NSString};
+use rusqlite::{Connection, OptionalExtension};
 
 const SIZE: f64 = 220.0;
 const COLORS: [(f64, f64, f64); 4] = [
@@ -25,7 +31,14 @@ fn main() {
     app.setAppearance(NSAppearance::appearanceNamed(unsafe { NSAppearanceNameAqua }).as_deref());
     app.setMainMenu(Some(&main_menu(mtm)));
 
-    let _notes: Vec<_> = (0..COLORS.len()).map(|i| note(mtm, i)).collect();
+    // Where macOS apps keep per-user data: ~/Library/Application Support/focus/notes.sqlite
+    let dir = std::env::home_dir()
+        .expect("no home dir")
+        .join("Library/Application Support/focus");
+    std::fs::create_dir_all(&dir).expect("can't create the app data dir");
+    let db = Rc::new(open_db(&dir.join("notes.sqlite")));
+
+    let _notes: Vec<_> = (0..COLORS.len()).map(|i| note(mtm, i, &db)).collect();
 
     // `activate()` is cooperative since macOS 14 and doesn't bring a shell-launched,
     // unbundled binary to the front; the deprecated call still does.
@@ -34,7 +47,7 @@ fn main() {
     app.run();
 }
 
-fn note(mtm: MainThreadMarker, i: usize) -> Retained<NSWindow> {
+fn note(mtm: MainThreadMarker, i: usize, db: &Rc<Connection>) -> Retained<NSWindow> {
     let (r, g, b) = COLORS[i];
     let color = NSColor::colorWithSRGBRed_green_blue_alpha(r, g, b, 1.0);
     let origin = NSPoint::new(100.0 + i as f64 * (SIZE + 30.0), 400.0);
@@ -52,6 +65,24 @@ fn note(mtm: MainThreadMarker, i: usize) -> Retained<NSWindow> {
     unsafe { text.textContainer() }
         .unwrap()
         .setLineFragmentPadding(0.0);
+
+    if let Some(saved) = load(db, i) {
+        text.setString(&NSString::from_str(&saved));
+    }
+    // Save on every edit (typing, paste, cut), so quitting via Ctrl+C or a crash loses nothing.
+    // `setString` doesn't post this notification, so loading above doesn't re-save.
+    let (db, view) = (Rc::clone(db), text.clone());
+    let on_change =
+        RcBlock::new(move |_: NonNull<NSNotification>| save(&db, i, &view.string().to_string()));
+    // No queue: the block runs synchronously on the posting (main) thread, so it needn't be Send.
+    unsafe {
+        NSNotificationCenter::defaultCenter().addObserverForName_object_queue_usingBlock(
+            Some(NSTextDidChangeNotification),
+            Some(&text),
+            None,
+            &on_change,
+        )
+    };
 
     // Only the top-left quarter of the note is text (non-flipped: y grows upwards).
     // Size and right/bottom margins are all flexible, so resizes split evenly and keep it a quarter.
@@ -89,6 +120,34 @@ fn note(mtm: MainThreadMarker, i: usize) -> Retained<NSWindow> {
     window
 }
 
+/// One row per note, keyed by the note index (like the `note{i}` frame autosave names).
+fn open_db(path: &Path) -> Connection {
+    let db = Connection::open(path).expect("can't open the notes db");
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, text TEXT NOT NULL)",
+        (),
+    )
+    .expect("can't create the notes table");
+    db
+}
+
+fn load(db: &Connection, id: usize) -> Option<String> {
+    // Fatal: starting blank would overwrite the saved note on the first keystroke.
+    db.query_row("SELECT text FROM notes WHERE id = ?1", [id as i64], |row| {
+        row.get(0)
+    })
+    .optional()
+    .expect("can't read the notes db")
+}
+
+fn save(db: &Connection, id: usize, text: &str) {
+    // Log, don't panic: this runs inside an AppKit callback, and the next edit retries.
+    let sql = "INSERT OR REPLACE INTO notes (id, text) VALUES (?1, ?2)";
+    if let Err(e) = db.execute(sql, (id as i64, text)) {
+        eprintln!("can't save note{id}: {e}");
+    }
+}
+
 /// Without a menu bar there's no Cmd+Q and no copy/paste in the text views.
 fn main_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
     let bar = NSMenu::new(mtm);
@@ -120,4 +179,15 @@ fn submenu(
     let top = NSMenuItem::new(mtm);
     top.setSubmenu(Some(&menu));
     top
+}
+
+#[test]
+fn notes_round_trip() {
+    let db = open_db(Path::new(":memory:"));
+    assert_eq!(load(&db, 0), None);
+    save(&db, 0, "first");
+    save(&db, 0, "second");
+    save(&db, 1, "");
+    assert_eq!(load(&db, 0).as_deref(), Some("second"));
+    assert_eq!(load(&db, 1).as_deref(), Some(""));
 }

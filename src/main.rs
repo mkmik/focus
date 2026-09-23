@@ -1,4 +1,6 @@
 //! POC: sticky-note windows whose titlebar is the same color as the body.
+mod herdr;
+
 use std::path::Path;
 use std::ptr::NonNull;
 use std::rc::Rc;
@@ -11,16 +13,18 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSAppearance, NSAppearanceNameAqua, NSApplication, NSApplicationActivationPolicy,
-    NSApplicationDelegate, NSAutoresizingMaskOptions, NSColor, NSControl, NSControlStateValueOff,
-    NSControlStateValueOn, NSControlTextDidChangeNotification,
-    NSControlTextDidEndEditingNotification, NSEvent, NSFloatingWindowLevel, NSFont,
-    NSLineBreakMode, NSMenu, NSMenuItem, NSMenuItemValidation, NSNormalWindowLevel, NSResponder,
-    NSTextDidChangeNotification, NSTextField, NSTextView, NSView, NSViewController, NSWindow,
-    NSWindowButton, NSWindowStyleMask, NSWindowTitleVisibility,
+    NSApplicationDelegate, NSAutoresizingMaskOptions, NSColor, NSComboBox,
+    NSComboBoxWillDismissNotification, NSControl, NSControlStateValueOff, NSControlStateValueOn,
+    NSControlTextDidChangeNotification, NSControlTextDidEndEditingNotification, NSEvent,
+    NSEventType, NSFloatingWindowLevel, NSFont, NSFontAttributeName, NSFontManager,
+    NSFontTraitMask, NSLineBreakMode, NSMenu, NSMenuItem, NSMenuItemValidation,
+    NSMutableParagraphStyle, NSNormalWindowLevel, NSParagraphStyleAttributeName, NSResponder,
+    NSTextAlignment, NSTextDidChangeNotification, NSTextField, NSTextView, NSView,
+    NSViewController, NSWindow, NSWindowButton, NSWindowStyleMask, NSWindowTitleVisibility,
 };
 use objc2_foundation::{
-    NSNotification, NSNotificationCenter, NSNotificationName, NSObject, NSObjectProtocol, NSPoint,
-    NSRect, NSSize, NSString, NSUserDefaults,
+    NSAttributedString, NSDictionary, NSNotification, NSNotificationCenter, NSNotificationName,
+    NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSUserDefaults,
 };
 use rusqlite::{Connection, OptionalExtension};
 
@@ -128,7 +132,7 @@ fn note(mtm: MainThreadMarker, i: usize, db: &Rc<Connection>) -> Retained<NSWind
     // The title: a label pixel-identical to AppKit's own title once that's too long to center
     // (titlebar font, from 6pt past the traffic lights to 6pt before the edge, 1pt above them).
     let saved = NSString::from_str(&load(db, "titles", i).unwrap_or_default());
-    let title: Retained<Title> = unsafe { msg_send![Title::class(), labelWithString: &*saved] };
+    let title: Retained<Label> = unsafe { msg_send![Label::class(), labelWithString: &*saved] };
     title.setFont(Some(&NSFont::titleBarFontOfSize(0.0)));
     title.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
     let zoom = window
@@ -140,6 +144,12 @@ fn note(mtm: MainThreadMarker, i: usize, db: &Rc<Connection>) -> Retained<NSWind
     unsafe { zoom.superview() }.unwrap().addSubview(&title);
     // The real title stays hidden, but VoiceOver and the Dock's window list still read it.
     window.setTitle(&saved);
+    // A double-click edits it, all selected, like renaming in Finder.
+    let (field, win) = (title.clone(), window.clone());
+    observe(&NSString::from_str(DOUBLE_CLICK), &title, move || {
+        field.setEditable(true);
+        win.makeFirstResponder(Some(&field));
+    });
     let (db2, field, win) = (Rc::clone(db), title.clone(), window.clone());
     observe(
         unsafe { NSControlTextDidChangeNotification },
@@ -151,13 +161,118 @@ fn note(mtm: MainThreadMarker, i: usize, db: &Rc<Connection>) -> Retained<NSWind
         },
     );
     // Done (Return, or a click in the note): back to a label, and on to the note's text.
-    let (field, win) = (title.clone(), window.clone());
+    let (field, win, text2) = (title.clone(), window.clone(), text.clone());
     observe(
         unsafe { NSControlTextDidEndEditingNotification },
         &title,
         move || {
             field.setEditable(false);
-            win.makeFirstResponder(Some(&text));
+            win.makeFirstResponder(Some(&text2));
+        },
+    );
+
+    // Bottom right, 8px in like the text: the herdr workspace the note is about. Bold gray like
+    // the title of a note in the background (tertiary is what AppKit dims that to), until a
+    // double-click swaps it for a combobox of herdr's workspace names.
+    let saved = NSString::from_str(&load(db, "workspaces", i).unwrap_or_default());
+    let workspace: Retained<Label> = unsafe { msg_send![Label::class(), labelWithString: &*saved] };
+    workspace.setFont(Some(&NSFont::titleBarFontOfSize(0.0)));
+    workspace.setTextColor(Some(&NSColor::tertiaryLabelColor()));
+    workspace.setAlignment(NSTextAlignment::Right);
+    workspace.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+    // Unset, it shows where to double-click: a placeholder, in regular italic, not bold. An
+    // attributed placeholder ignores the label's alignment, hence one of its own.
+    let italic = NSFontManager::sharedFontManager(mtm).convertFont_toHaveTrait(
+        &NSFont::systemFontOfSize(0.0),
+        NSFontTraitMask::ItalicFontMask,
+    );
+    let right = NSMutableParagraphStyle::new();
+    right.setAlignment(NSTextAlignment::Right);
+    let attributes = NSDictionary::from_slices(
+        &unsafe { [NSFontAttributeName, NSParagraphStyleAttributeName] },
+        &[&*italic as &AnyObject, &*right],
+    );
+    let placeholder = NSString::from_str("herdr...");
+    let placeholder = unsafe { NSAttributedString::new_with_attributes(&placeholder, &attributes) };
+    workspace.setPlaceholderAttributedString(Some(&placeholder));
+    let height = workspace.intrinsicContentSize().height;
+    workspace.setFrame(NSRect::new(
+        NSPoint::new(8.0, 8.0),
+        NSSize::new(SIZE - 16.0, height),
+    ));
+    body.addSubview(&workspace);
+    // Same width, centered on the label's line.
+    let picker = NSComboBox::new(mtm);
+    let h = picker.intrinsicContentSize().height;
+    picker.setFrame(NSRect::new(
+        NSPoint::new(8.0, 8.0 + (height - h) / 2.0),
+        NSSize::new(SIZE - 16.0, h),
+    ));
+    picker.setCompletes(true); // typing a name's start fills in the rest
+    picker.setHidden(true);
+    body.addSubview(&picker);
+
+    let (label, combo, win) = (workspace.clone(), picker.clone(), window.clone());
+    observe(&NSString::from_str(DOUBLE_CLICK), &workspace, move || {
+        combo.removeAllItems();
+        unsafe { combo.addItemWithObjectValue(&NSString::from_str(NO_WORKSPACE)) };
+        match herdr::workspaces(&herdr::socket()) {
+            Ok(names) => {
+                for name in names {
+                    unsafe { combo.addItemWithObjectValue(&NSString::from_str(&name)) };
+                }
+            }
+            // Leaves just (none) to pick: a name can still be typed in.
+            Err(e) => eprintln!("can't list herdr's workspaces: {e}"),
+        }
+        // Empty, the current name as its placeholder: a list opens scrolled to the item that
+        // matches the field, which would hide (none) above it.
+        combo.setStringValue(&NSString::new());
+        combo.setPlaceholderString(Some(&label.stringValue()));
+        label.setHidden(true);
+        combo.setHidden(false);
+        win.makeFirstResponder(Some(&combo));
+    });
+    // Done (Return, or a click elsewhere): back to the label, and on to the note's text.
+    let (db2, label, combo, win, text2) = (
+        Rc::clone(db),
+        workspace.clone(),
+        picker.clone(),
+        window.clone(),
+        text.clone(),
+    );
+    observe(
+        unsafe { NSControlTextDidEndEditingNotification },
+        &picker,
+        move || {
+            // Left empty, it keeps the current name; (none) unsets it, back to the placeholder.
+            let s = combo.stringValue().to_string();
+            if !s.is_empty() {
+                let s = if s == NO_WORKSPACE { "" } else { s.as_str() };
+                label.setStringValue(&NSString::from_str(s));
+                save(&db2, "workspaces", i, s);
+            }
+            combo.setHidden(true);
+            label.setHidden(false);
+            win.makeFirstResponder(Some(&text2));
+        },
+    );
+    // A click in the list is done too: of all the ways the list closes, only that one is on a
+    // mouse-up (a click elsewhere closes it on the mouse-down). The pick only reaches the field
+    // after the list is gone, too late for the save above, so put it there now.
+    let (combo, win) = (picker.clone(), window.clone());
+    observe(
+        unsafe { NSComboBoxWillDismissNotification },
+        &picker,
+        move || {
+            let app = NSApplication::sharedApplication(mtm);
+            let click = app
+                .currentEvent()
+                .is_some_and(|e| e.r#type() == NSEventType::LeftMouseUp);
+            if click && let Some(pick) = combo.objectValueOfSelectedItem() {
+                unsafe { combo.setObjectValue(Some(&pick)) };
+                win.makeFirstResponder(Some(&text));
+            }
         },
     );
 
@@ -165,20 +280,26 @@ fn note(mtm: MainThreadMarker, i: usize, db: &Rc<Connection>) -> Retained<NSWind
     window
 }
 
+/// Posted by a [`Label`] when double-clicked.
+const DOUBLE_CLICK: &str = "LabelDoubleClick";
+/// Tops the list of workspaces; picking it unsets the note's.
+const NO_WORKSPACE: &str = "(none)";
+
 define_class!(
-    // SAFETY: NSTextField has no subclassing requirements, and Title doesn't implement Drop.
+    // SAFETY: NSTextField has no subclassing requirements, and Label doesn't implement Drop.
     #[unsafe(super(NSTextField, NSControl, NSView, NSResponder, NSObject))]
     #[thread_kind = MainThreadOnly]
-    struct Title;
+    struct Label;
 
-    impl Title {
-        // A double-click edits it, all selected, like renaming in Finder. Other clicks get the
-        // label default, and a label counts as titlebar: dragging it moves the window.
+    impl Label {
+        // A double-click posts DOUBLE_CLICK, for `observe` to act on. Other clicks get the label
+        // default, and a label counts as titlebar: dragging the title moves the window.
         #[unsafe(method(mouseDown:))]
         fn mouse_down(&self, event: &NSEvent) {
             if event.clickCount() == 2 {
-                self.setEditable(true);
-                self.window().unwrap().makeFirstResponder(Some(self));
+                let name = NSString::from_str(DOUBLE_CLICK);
+                let center = NSNotificationCenter::defaultCenter();
+                unsafe { center.postNotificationName_object(&name, Some(self)) };
             } else {
                 unsafe { msg_send![super(self), mouseDown: event] }
             }
@@ -201,18 +322,20 @@ fn observe(name: &NSNotificationName, object: &AnyObject, f: impl Fn() + 'static
 }
 
 /// One row per note in each table, keyed by the note index (like the `note{i}` frame autosave
-/// names). Titles got their own table, not a column, so notes dbs from before need no migration.
+/// names). Titles and workspaces got their own tables, not columns, so notes dbs from before need
+/// no migration.
 fn open_db(path: &Path) -> Connection {
     let db = Connection::open(path).expect("can't open the notes db");
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, text TEXT NOT NULL);
-         CREATE TABLE IF NOT EXISTS titles (id INTEGER PRIMARY KEY, text TEXT NOT NULL);",
+         CREATE TABLE IF NOT EXISTS titles (id INTEGER PRIMARY KEY, text TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS workspaces (id INTEGER PRIMARY KEY, text TEXT NOT NULL);",
     )
     .expect("can't create the notes tables");
     db
 }
 
-/// `table` goes into the SQL as is, hence 'static: "notes" or "titles".
+/// `table` goes into the SQL as is, hence 'static: "notes", "titles" or "workspaces".
 fn load(db: &Connection, table: &'static str, id: usize) -> Option<String> {
     // Fatal: starting blank would overwrite the saved note on the first keystroke.
     let sql = format!("SELECT text FROM {table} WHERE id = ?1");
@@ -334,8 +457,10 @@ fn notes_round_trip() {
     save(&db, "notes", 0, "second");
     save(&db, "notes", 1, "");
     save(&db, "titles", 0, "title");
+    save(&db, "workspaces", 1, "focus");
     assert_eq!(load(&db, "notes", 0).as_deref(), Some("second"));
     assert_eq!(load(&db, "notes", 1).as_deref(), Some(""));
     assert_eq!(load(&db, "titles", 0).as_deref(), Some("title"));
     assert_eq!(load(&db, "titles", 1), None);
+    assert_eq!(load(&db, "workspaces", 1).as_deref(), Some("focus"));
 }

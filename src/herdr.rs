@@ -1,5 +1,4 @@
 //! Just enough of herdr's socket API for the notes: newline-delimited JSON over a Unix socket.
-use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -27,40 +26,24 @@ pub fn workspaces(socket: &Path) -> io::Result<Vec<String>> {
         .collect())
 }
 
-/// Whether any pane in the workspace named `name` shows something else than at the last call with
-/// the same `screens`, which it keeps up to date (pane id → text on screen). herdr doesn't say when
-/// a pane last changed, so we look: anyone typing, or an agent at work, changes what's on screen.
-pub fn changed(
-    socket: &Path,
-    name: &str,
-    screens: &mut HashMap<String, String>,
-) -> io::Result<bool> {
-    let ids: Vec<Value> = list(socket, "workspace.list", "workspaces")?
-        .into_iter()
-        .filter(|w| w["label"] == name)
-        .map(|w| w["workspace_id"].clone())
-        .collect();
-    let mut now = HashMap::new();
-    let mut changed = false;
-    for pane in list(socket, "pane.list", "panes")? {
-        if !ids.contains(&pane["workspace_id"]) {
-            continue;
+/// Whether the workspace named `name` is in use: it's the one herdr shows, or an agent in it is at
+/// work. Its screens can't tell: dashboards like `ccwt ws` redraw with nobody there.
+pub fn in_use(socket: &Path, name: &str) -> io::Result<bool> {
+    let mut ids = Vec::new();
+    for w in list(socket, "workspace.list", "workspaces")? {
+        if w["label"] == name {
+            // ponytail: shown isn't watched (herdr may sit behind another app); gate on recent
+            // input (CGEventSourceSecondsSinceLastEventType) if that matters.
+            if w["focused"] == true {
+                return Ok(true);
+            }
+            ids.push(w["workspace_id"].clone());
         }
-        let Some(id) = pane["pane_id"].as_str() else {
-            continue;
-        };
-        let params = json!({"pane_id": id, "source": "visible", "format": "text"});
-        // One that can't be read (closed since the list?) sits this look out.
-        let Ok(read) = call(socket, "pane.read", params) else {
-            continue;
-        };
-        let text = read["read"]["text"].as_str().unwrap_or_default();
-        // A pane new to us (just opened, or we just started looking) has nothing to compare with.
-        changed |= screens.get(id).is_some_and(|was| was != text);
-        now.insert(id.to_owned(), text.to_owned());
     }
-    *screens = now;
-    Ok(changed)
+    // Each pane's status, not the workspace's: that says "blocked" if any agent waits on you.
+    Ok(list(socket, "pane.list", "panes")?
+        .iter()
+        .any(|p| ids.contains(&p["workspace_id"]) && p["agent_status"] == "working"))
 }
 
 /// Calls `method`, which takes no params, for the `key` list in its result.
@@ -88,60 +71,45 @@ fn call(socket: &Path, method: &str, params: Value) -> io::Result<Value> {
 }
 
 #[test]
-fn spots_changed_screens() {
+fn tells_workspaces_in_use() {
     use std::os::unix::net::UnixListener;
-    use std::sync::{Arc, Mutex};
-    let path = std::env::temp_dir().join(format!("focus-test-{}-screens.sock", std::process::id()));
+    let path = std::env::temp_dir().join(format!("focus-test-{}-in-use.sock", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path).unwrap();
-    // What's on each pane's screen, by pane id: workspace a (w1) has two tabs, b (w2) one.
-    let shown = Arc::new(Mutex::new(HashMap::from([
-        ("w1:p1", ("w1", "$")),
-        ("w1:p2", ("w1", "$")),
-        ("w2:p1", ("w2", "$")),
-    ])));
-    // A herdr that answers any number of requests, from `shown`.
-    let panes = Arc::clone(&shown);
+    // A herdr that answers any number of requests: "shown" is on screen, "idle" has an agent done
+    // working, and "busy" one at work, next to one that makes the workspace say "blocked".
     std::thread::spawn(move || {
         for conn in listener.incoming() {
             let mut conn = conn.unwrap();
             let mut line = String::new();
             BufReader::new(&conn).read_line(&mut line).unwrap();
             let request: Value = serde_json::from_str(&line).unwrap();
-            let panes = panes.lock().unwrap();
             let result = match request["method"].as_str().unwrap() {
                 "workspace.list" => json!({"workspaces": [
-                    {"workspace_id": "w1", "label": "a"},
-                    {"workspace_id": "w2", "label": "b"},
+                    {"workspace_id": "w1", "label": "shown", "focused": true},
+                    {"workspace_id": "w2", "label": "idle", "focused": false},
+                    {"workspace_id": "w3", "label": "busy", "focused": false},
                 ]}),
-                "pane.list" => {
-                    let list = panes
-                        .iter()
-                        .map(|(id, (w, _))| json!({"pane_id": id, "workspace_id": w}));
-                    json!({"panes": list.collect::<Vec<_>>()})
-                }
-                "pane.read" => {
-                    let (_, text) = panes[request["params"]["pane_id"].as_str().unwrap()];
-                    json!({"read": {"text": text}})
-                }
+                "pane.list" => json!({"panes": [
+                    {"workspace_id": "w1", "agent_status": "unknown"},
+                    {"workspace_id": "w2", "agent_status": "idle"},
+                    {"workspace_id": "w3", "agent_status": "blocked"},
+                    {"workspace_id": "w3", "agent_status": "working"},
+                ]}),
                 method => panic!("{method}"),
             };
             writeln!(conn, "{}", json!({"id": "1", "result": result})).unwrap();
         }
     });
 
-    let mut screens = HashMap::new();
-    // Nothing to compare with at first, then nothing new.
-    assert!(!changed(&path, "a", &mut screens).unwrap());
-    assert!(!changed(&path, "a", &mut screens).unwrap());
-    // Typing in b is none of a's business, and a new tab in a is only new.
-    shown.lock().unwrap().insert("w2:p1", ("w2", "$ ls"));
-    shown.lock().unwrap().insert("w1:p3", ("w1", "$"));
-    assert!(!changed(&path, "a", &mut screens).unwrap());
-    // Typing in a's second tab is.
-    shown.lock().unwrap().insert("w1:p2", ("w1", "$ ls"));
-    assert!(changed(&path, "a", &mut screens).unwrap());
-    assert!(!changed(&path, "a", &mut screens).unwrap());
+    for (name, used) in [
+        ("shown", true),
+        ("idle", false),
+        ("busy", true),
+        ("gone", false),
+    ] {
+        assert_eq!(in_use(&path, name).unwrap(), used, "{name}");
+    }
     std::fs::remove_file(&path).unwrap();
 }
 

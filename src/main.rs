@@ -1,8 +1,6 @@
 //! POC: sticky-note windows whose titlebar is the same color as the body.
 mod herdr;
 
-use std::cell::RefCell;
-use std::collections::HashMap;
 use std::path::Path;
 use std::ptr::NonNull;
 use std::rc::Rc;
@@ -60,7 +58,7 @@ fn main() {
     let delegate = Delegate::new(mtm, notes);
     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
 
-    // Every 10s, each note looks at its workspace's screens for changes, and updates its age.
+    // Every 10s, each note checks whether its workspace is in use, and updates its age.
     let tick = move || ticks.iter().for_each(|tick| tick());
     tick();
     let tick = RcBlock::new(move |_: NonNull<NSTimer>| tick());
@@ -226,8 +224,8 @@ fn note(
     picker.setHidden(true);
     body.addSubview(&picker);
 
-    // Top right, 8px in like the text: how long ago anything changed on the workspace's screens
-    // (see `ago`), blank if never seen. In the workspace's bold gray, a little bigger.
+    // Top right, 8px in like the text: how long ago the workspace was last in use (see
+    // `herdr::in_use` and `ago`), blank if never seen. In the workspace's bold gray, a little bigger.
     let age = NSTextField::labelWithString(&NSString::new(), mtm);
     age.setFont(Some(&NSFont::boldSystemFontOfSize(15.0)));
     age.setTextColor(Some(&NSColor::tertiaryLabelColor()));
@@ -240,16 +238,11 @@ fn note(
     // Like the text, it stays at the top when the titlebar takes its share of the height.
     age.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinYMargin);
     body.addSubview(&age);
-    // What its panes showed at the last look, by pane id.
-    let (db2, label, screens) = (
-        Rc::clone(db),
-        workspace.clone(),
-        RefCell::new(HashMap::new()),
-    );
+    let (db2, label) = (Rc::clone(db), workspace.clone());
     let tick: Rc<dyn Fn()> = Rc::new(move || {
         let name = label.stringValue().to_string();
         // Unreachable (not running?), the age just goes on counting.
-        if herdr::changed(&herdr::socket(), &name, &mut screens.borrow_mut()).unwrap_or(false) {
+        if herdr::in_use(&herdr::socket(), &name).unwrap_or(false) {
             set_worked(&db2, &name);
         }
         let secs = worked_ago(&db2, &name);

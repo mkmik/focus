@@ -106,24 +106,11 @@ fn note(
         save(&db2, "notes", i, &view.string().to_string())
     });
 
-    // Only the top-left quarter of the note is text (non-flipped: y grows upwards).
-    // Size and right/bottom margins are all flexible, so resizes split evenly and keep it a quarter.
     let half = SIZE / 2.0;
     let body = NSView::initWithFrame(
         NSView::alloc(mtm),
         NSRect::new(NSPoint::ZERO, NSSize::new(SIZE, SIZE)),
     );
-    scroll.setFrame(NSRect::new(
-        NSPoint::new(0.0, half),
-        NSSize::new(half, half),
-    ));
-    scroll.setAutoresizingMask(
-        NSAutoresizingMaskOptions::ViewWidthSizable
-            | NSAutoresizingMaskOptions::ViewMaxXMargin
-            | NSAutoresizingMaskOptions::ViewHeightSizable
-            | NSAutoresizingMaskOptions::ViewMinYMargin,
-    );
-    body.addSubview(&scroll);
     let vc = NSViewController::new(mtm);
     vc.setView(&body);
 
@@ -238,6 +225,18 @@ fn note(
     // Like the text, it stays at the top when the titlebar takes its share of the height.
     age.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinYMargin);
     body.addSubview(&age);
+
+    // The text fills the rest: full width, between the workspace below and the age above
+    // (non-flipped: y grows upwards). Only its height gives when the titlebar takes its share.
+    let bottom = picker.frame().max().y.max(8.0 + height); // clear of the picker too
+    scroll.setFrame(NSRect::new(
+        NSPoint::new(0.0, bottom),
+        NSSize::new(SIZE, SIZE - 8.0 - h - bottom),
+    ));
+    scroll.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
+    );
+    body.addSubview(&scroll);
     let (db2, label) = (Rc::clone(db), workspace.clone());
     let tick: Rc<dyn Fn()> = Rc::new(move || {
         let name = label.stringValue().to_string();

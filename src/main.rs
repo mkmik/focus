@@ -2,7 +2,7 @@
 mod herdr;
 
 use std::path::Path;
-use std::ptr::NonNull;
+use std::ptr::{NonNull, null_mut};
 use std::rc::Rc;
 
 use block2::RcBlock;
@@ -13,18 +13,21 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSAppearance, NSAppearanceNameAqua, NSApplication, NSApplicationActivationPolicy,
-    NSApplicationDelegate, NSAutoresizingMaskOptions, NSColor, NSComboBox,
+    NSApplicationDelegate, NSAutoresizingMaskOptions, NSBezierPath, NSColor, NSComboBox,
     NSComboBoxWillDismissNotification, NSControl, NSControlStateValueOff, NSControlStateValueOn,
     NSControlTextDidChangeNotification, NSControlTextDidEndEditingNotification, NSEvent,
-    NSEventType, NSFloatingWindowLevel, NSFont, NSFontAttributeName, NSFontManager,
-    NSFontTraitMask, NSLineBreakMode, NSMenu, NSMenuItem, NSMenuItemValidation,
-    NSMutableParagraphStyle, NSNormalWindowLevel, NSParagraphStyleAttributeName, NSResponder,
-    NSTextAlignment, NSTextDidChangeNotification, NSTextField, NSTextView, NSView,
-    NSViewController, NSWindow, NSWindowButton, NSWindowStyleMask, NSWindowTitleVisibility,
+    NSEventModifierFlags, NSEventType, NSFloatingWindowLevel, NSFont, NSFontAttributeName,
+    NSFontManager, NSFontTraitMask, NSForegroundColorAttributeName, NSLineBreakMode, NSMenu,
+    NSMenuItem, NSMenuItemValidation, NSMutableParagraphStyle, NSNormalWindowLevel,
+    NSParagraphStyleAttributeName, NSResponder, NSScrollView, NSStrikethroughStyleAttributeName,
+    NSText, NSTextAlignment, NSTextDidChangeNotification, NSTextField, NSTextView,
+    NSUnderlineStyle, NSView, NSViewController, NSWindow, NSWindowButton, NSWindowStyleMask,
+    NSWindowTitleVisibility,
 };
 use objc2_foundation::{
-    NSAttributedString, NSDictionary, NSNotification, NSNotificationCenter, NSNotificationName,
-    NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSTimer, NSUserDefaults,
+    NSAttributedString, NSAttributedStringKey, NSDictionary, NSMutableAttributedString,
+    NSNotification, NSNotificationCenter, NSNotificationName, NSNumber, NSObject, NSObjectProtocol,
+    NSPoint, NSRange, NSRect, NSSize, NSString, NSTimer, NSUserDefaults,
 };
 use rusqlite::{Connection, OptionalExtension};
 
@@ -82,12 +85,14 @@ fn note(
     let color = NSColor::colorWithSRGBRed_green_blue_alpha(r, g, b, 1.0);
     let origin = NSPoint::new(100.0 + i as f64 * (SIZE + 30.0), 400.0);
 
-    let scroll = NSTextView::scrollableTextView(mtm);
+    // Called on the subclass, it makes a scrollable Checklist.
+    let scroll: Retained<NSScrollView> =
+        unsafe { msg_send![Checklist::class(), scrollableTextView] };
     scroll.setHasVerticalScroller(false); // legacy (mouse) scrollers paint a gray track
     let text = scroll
         .documentView()
         .unwrap()
-        .downcast::<NSTextView>()
+        .downcast::<Checklist>()
         .unwrap();
     text.setDrawsBackground(false);
     // 8px padding on every side; the inset alone would stack on the default 5px line padding.
@@ -96,14 +101,14 @@ fn note(
         .unwrap()
         .setLineFragmentPadding(0.0);
 
-    if let Some(saved) = load(db, "notes", i) {
-        text.setString(&NSString::from_str(&saved));
-    }
-    // Save on every edit (typing, paste, cut), so quitting via Ctrl+C or a crash loses nothing.
-    // `setString` doesn't post this notification, so loading above doesn't re-save.
+    text.set_items(&load_list(db, i));
+    // Save on every edit (typing, paste, cut, a click on a box), so quitting via Ctrl+C or a crash
+    // loses nothing. `set_items` doesn't post this notification, so loading above doesn't re-save.
     let (db2, view) = (Rc::clone(db), text.clone());
     observe(unsafe { NSTextDidChangeNotification }, &text, move || {
-        save(&db2, "notes", i, &view.string().to_string())
+        let json =
+            serde_json::to_string(&view.items()).expect("strings and bools always serialize");
+        save(&db2, "lists", i, &json)
     });
 
     let half = SIZE / 2.0;
@@ -355,6 +360,224 @@ define_class!(
     }
 );
 
+/// Where an item's text starts: its box goes in the gap, and its lines all start there.
+const INDENT: f64 = 18.0;
+const BOX: f64 = 11.0;
+
+define_class!(
+    // SAFETY: NSTextView has no subclassing requirements, and Checklist doesn't implement Drop.
+    #[unsafe(super(NSTextView, NSText, NSView, NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    struct Checklist;
+
+    // Like Google Keep: each paragraph is an item with a box before it, checked ones struck
+    // through. Shift+Return breaks the line within an item. An item is checked iff its first
+    // character is struck through, and every edit spreads that to the whole item.
+    impl Checklist {
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, dirty: NSRect) {
+            unsafe { msg_send![super(self), drawRect: dirty] }
+            let storage = unsafe { self.textStorage() }.unwrap();
+            NSColor::secondaryLabelColor().setStroke();
+            for (start, _, line) in self.lines() {
+                let y = line.origin.y + (line.size.height - BOX) / 2.0;
+                let b = NSRect::new(NSPoint::new(line.origin.x, y), NSSize::new(BOX, BOX));
+                NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(b, 2.0, 2.0).stroke();
+                if checked(&storage, start) {
+                    let check = NSBezierPath::new();
+                    check.moveToPoint(NSPoint::new(b.origin.x + 2.5, y + BOX / 2.0));
+                    check.lineToPoint(NSPoint::new(b.origin.x + BOX * 0.42, y + BOX - 2.5));
+                    check.lineToPoint(NSPoint::new(b.origin.x + BOX - 2.0, y + 2.0));
+                    check.setLineWidth(1.5);
+                    check.stroke();
+                }
+            }
+        }
+
+        // A click on an item's box (or beside it, on its first line) toggles it.
+        #[unsafe(method(mouseDown:))]
+        fn mouse_down(&self, event: &NSEvent) {
+            let at = self.convertPoint_fromView(event.locationInWindow(), None);
+            if at.x < self.textContainerOrigin().x + INDENT {
+                let storage = unsafe { self.textStorage() }.unwrap();
+                for (start, end, line) in self.lines() {
+                    if (line.min().y..line.max().y).contains(&at.y) {
+                        // An empty last item has no character to strike: it can't be checked.
+                        if end > start {
+                            set_checked(&storage, start, end, !checked(&storage, start));
+                            self.didChangeText();
+                        }
+                        return;
+                    }
+                }
+            }
+            unsafe { msg_send![super(self), mouseDown: event] }
+        }
+
+        // Typing takes on the checkedness of the item it goes in, even at its start (where it'd
+        // otherwise take after the item above's newline).
+        #[unsafe(method(shouldChangeTextInRange:replacementString:))]
+        fn should_change(&self, range: NSRange, s: Option<&NSString>) -> bool {
+            let storage = unsafe { self.textStorage() }.unwrap();
+            let (start, ..) = paragraph(&storage.string(), range.location);
+            unsafe { self.setTypingAttributes(&attrs(checked(&storage, start))) };
+            unsafe { msg_send![super(self), shouldChangeTextInRange: range, replacementString: s] }
+        }
+
+        // An edit can leave an item half checked (backspacing two into one, pasting styled
+        // text): its first character decides. Then on to the notification, for the save.
+        #[unsafe(method(didChangeText))]
+        fn did_change_text(&self) {
+            let storage = unsafe { self.textStorage() }.unwrap();
+            storage.beginEditing();
+            for (start, _, end) in paragraphs(&storage.string()) {
+                set_checked(&storage, start, end, checked(&storage, start));
+            }
+            storage.endEditing();
+            self.setNeedsDisplay(true); // the boxes of the items it moved
+            unsafe { msg_send![super(self), didChangeText] }
+        }
+
+        #[unsafe(method(insertNewline:))]
+        fn insert_newline(&self, sender: Option<&AnyObject>) {
+            let app = NSApplication::sharedApplication(self.mtm());
+            let shift = app
+                .currentEvent()
+                .is_some_and(|e| e.modifierFlags().contains(NSEventModifierFlags::Shift));
+            if shift {
+                return unsafe { msg_send![self, insertLineBreak: sender] };
+            }
+            unsafe { msg_send![super(self), insertNewline: sender] }
+            // A new empty item starts unchecked, even after a checked one (whose newline it got).
+            let storage = unsafe { self.textStorage() }.unwrap();
+            let (start, contents, end) = paragraph(&storage.string(), self.selectedRange().location);
+            if start == contents && checked(&storage, start) {
+                set_checked(&storage, start, end, false);
+                unsafe { self.setTypingAttributes(&attrs(false)) };
+                self.didChangeText();
+            }
+        }
+    }
+);
+
+impl Checklist {
+    /// Each item's (start, end) in the text, and its first line's rect in the view.
+    fn lines(&self) -> Vec<(usize, usize, NSRect)> {
+        let (lm, tc) = unsafe { (self.layoutManager().unwrap(), self.textContainer().unwrap()) };
+        lm.ensureLayoutForTextContainer(&tc);
+        let origin = self.textContainerOrigin();
+        let s = self.string();
+        let paragraphs = paragraphs(&s).into_iter().map(|(start, _, end)| {
+            let line = if start < s.length() {
+                let glyph = lm.glyphIndexForCharacterAtIndex(start);
+                unsafe { lm.lineFragmentRectForGlyphAtIndex_effectiveRange(glyph, null_mut()) }
+            } else {
+                lm.extraLineFragmentRect() // empty last item
+            };
+            let at = NSPoint::new(line.origin.x + origin.x, line.origin.y + origin.y);
+            (start, end, NSRect::new(at, line.size))
+        });
+        paragraphs.collect()
+    }
+
+    /// Each item: whether it's checked, and its text (lines broken by '\n').
+    fn items(&self) -> Vec<(bool, String)> {
+        let storage = unsafe { self.textStorage() }.unwrap();
+        let s = storage.string();
+        let items = paragraphs(&s).into_iter().map(|(start, contents, _)| {
+            let text = s.substringWithRange(NSRange::new(start, contents - start));
+            (
+                checked(&storage, start),
+                text.to_string().replace('\u{2028}', "\n"),
+            )
+        });
+        items.collect()
+    }
+
+    fn set_items(&self, items: &[(bool, String)]) {
+        // Within an item, line breaks are line separators: a newline would start another item.
+        let lines: Vec<_> = items
+            .iter()
+            .map(|(_, s)| s.replace('\n', "\u{2028}"))
+            .collect();
+        self.setString(&NSString::from_str(&lines.join("\n")));
+        let storage = unsafe { self.textStorage() }.unwrap();
+        for ((start, _, end), (checked, _)) in paragraphs(&storage.string()).into_iter().zip(items)
+        {
+            set_checked(&storage, start, end, *checked);
+        }
+        unsafe { self.setTypingAttributes(&attrs(false)) };
+    }
+}
+
+/// How an item's text looks: indented past its box, and when checked, grayed and struck through.
+fn attrs(checked: bool) -> Retained<NSDictionary<NSAttributedStringKey, AnyObject>> {
+    let indent = NSMutableParagraphStyle::new();
+    indent.setFirstLineHeadIndent(INDENT);
+    indent.setHeadIndent(INDENT);
+    let font = NSFont::systemFontOfSize(0.0);
+    let color = if checked {
+        NSColor::secondaryLabelColor()
+    } else {
+        NSColor::labelColor()
+    };
+    let strike = NSNumber::new_isize(NSUnderlineStyle::Single.0);
+    let (mut keys, mut values) = unsafe {
+        (
+            vec![
+                NSFontAttributeName,
+                NSParagraphStyleAttributeName,
+                NSForegroundColorAttributeName,
+            ],
+            vec![&*font as &AnyObject, &*indent, &*color],
+        )
+    };
+    if checked {
+        keys.push(unsafe { NSStrikethroughStyleAttributeName });
+        values.push(&*strike);
+    }
+    NSDictionary::from_slices(&keys, &values)
+}
+
+/// Checks, or unchecks, the item from `start` to `end`.
+fn set_checked(text: &NSMutableAttributedString, start: usize, end: usize, checked: bool) {
+    let range = NSRange::new(start, end - start);
+    unsafe { text.setAttributes_range(Some(&attrs(checked)), range) };
+}
+
+/// Whether the item starting `at` is checked.
+fn checked(text: &NSAttributedString, at: usize) -> bool {
+    let strike = unsafe { NSStrikethroughStyleAttributeName };
+    at < text.length()
+        && unsafe { text.attribute_atIndex_effectiveRange(strike, at, null_mut()) }.is_some()
+}
+
+/// The paragraph `at` is in: its start, its contents' end, and where the next one starts.
+fn paragraph(s: &NSString, at: usize) -> (usize, usize, usize) {
+    let (mut start, mut contents, mut end) = (0, 0, 0);
+    let range = NSRange::new(at, 0);
+    unsafe {
+        s.getParagraphStart_end_contentsEnd_forRange(&mut start, &mut end, &mut contents, range)
+    };
+    (start, contents, end)
+}
+
+/// All of `s`'s paragraphs, as `paragraph` has them: there's always one, if only empty.
+fn paragraphs(s: &NSString) -> Vec<(usize, usize, usize)> {
+    let mut all = vec![paragraph(s, 0)];
+    loop {
+        let &(_, contents, end) = all.last().unwrap();
+        if end == s.length() {
+            // Ending on a newline, there's an empty one after it.
+            if contents < end {
+                all.push((end, end, end));
+            }
+            return all;
+        }
+        all.push(paragraph(s, end));
+    }
+}
+
 /// Runs `f` on every `name` notification `object` posts. No queue: it runs synchronously on the
 /// posting (main) thread, so it needn't be Send.
 fn observe(name: &NSNotificationName, object: &AnyObject, f: impl Fn() + 'static) {
@@ -371,12 +594,14 @@ fn observe(name: &NSNotificationName, object: &AnyObject, f: impl Fn() + 'static
 
 /// One row per note in each table, keyed by the note index (like the `note{i}` frame autosave
 /// names). Titles and workspaces got their own tables, not columns, so notes dbs from before need
-/// no migration. Except `worked`: one row per herdr workspace (by name) a note has seen in use.
+/// no migration; so did checklists (`lists`), superseding the plain text `notes`, which stay as a
+/// backup (see `load_list`). Except `worked`: one row per herdr workspace (by name) a note has seen in use.
 fn open_db(path: &Path) -> Connection {
     let db = Connection::open(path).expect("can't open the notes db");
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, text TEXT NOT NULL);
          CREATE TABLE IF NOT EXISTS titles (id INTEGER PRIMARY KEY, text TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS lists (id INTEGER PRIMARY KEY, text TEXT NOT NULL);
          CREATE TABLE IF NOT EXISTS workspaces (id INTEGER PRIMARY KEY, text TEXT NOT NULL);
          CREATE TABLE IF NOT EXISTS worked (name TEXT PRIMARY KEY, at INTEGER NOT NULL);",
     )
@@ -384,7 +609,21 @@ fn open_db(path: &Path) -> Connection {
     db
 }
 
-/// `table` goes into the SQL as is, hence 'static: "notes", "titles" or "workspaces".
+/// The note's checklist items, as JSON `[[checked, text], ...]`; from before checklists, one
+/// unchecked item per line of its text.
+fn load_list(db: &Connection, id: usize) -> Vec<(bool, String)> {
+    match load(db, "lists", id) {
+        // Fatal, like `load`: starting blank would overwrite it on the first keystroke.
+        Some(json) => serde_json::from_str(&json).expect("can't parse a saved list"),
+        None => load(db, "notes", id)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| (false, line.to_owned()))
+            .collect(),
+    }
+}
+
+/// `table` goes into the SQL as is, hence 'static: "notes", "lists", "titles" or "workspaces".
 fn load(db: &Connection, table: &'static str, id: usize) -> Option<String> {
     // Fatal: starting blank would overwrite the saved note on the first keystroke.
     let sql = format!("SELECT text FROM {table} WHERE id = ?1");
@@ -531,6 +770,27 @@ fn notes_round_trip() {
     assert_eq!(worked_ago(&db, "focus"), None);
     set_worked(&db, "focus");
     assert!(worked_ago(&db, "focus").is_some_and(|secs| (0..=1).contains(&secs)));
+}
+
+#[test]
+fn lists_migrate_from_notes() {
+    let db = open_db(Path::new(":memory:"));
+    assert_eq!(load_list(&db, 0), []);
+    save(&db, "notes", 0, "milk\neggs\n");
+    let items = vec![(false, "milk".to_owned()), (false, "eggs".to_owned())];
+    assert_eq!(load_list(&db, 0), items);
+    save(&db, "lists", 0, r#"[[true,"two\nlines"],[false,""]]"#);
+    let items = vec![(true, "two\nlines".to_owned()), (false, String::new())];
+    assert_eq!(load_list(&db, 0), items);
+}
+
+#[test]
+fn paragraphs_are_items() {
+    let p = |s: &str| paragraphs(&NSString::from_str(s));
+    assert_eq!(p(""), [(0, 0, 0)]);
+    assert_eq!(p("a"), [(0, 1, 1)]);
+    assert_eq!(p("a\nbc\n"), [(0, 1, 2), (2, 4, 5), (5, 5, 5)]);
+    assert_eq!(p("a\u{2028}b\n\nc"), [(0, 3, 4), (4, 4, 5), (5, 6, 6)]);
 }
 
 #[test]

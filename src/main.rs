@@ -656,10 +656,14 @@ fn worked_ago(db: &Connection, name: &str) -> Option<i64> {
     db.query_row(sql, [name], |row| row.get(0)).ok()
 }
 
-/// Without a menu bar there's no Cmd+Q and no copy/paste in the text views.
+/// Without a menu bar there's no Cmd+Q, no Cmd+H, no copy/paste in the text views.
 fn main_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
     let bar = NSMenu::new(mtm);
-    bar.addItem(&submenu(mtm, "App", &[("Quit", sel!(terminate:), "q")]));
+    bar.addItem(&submenu(
+        mtm,
+        "App",
+        &[("Hide", sel!(hide:), "h"), ("Quit", sel!(terminate:), "q")],
+    ));
     bar.addItem(&submenu(
         mtm,
         "Edit",
